@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>QR Code Document Generator</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      max-width: 640px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #222;
+      background: #fafafa;
+    }
+    h1 { font-size: 1.5rem; }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-top: 24px;
+      margin-bottom: 6px;
+    }
+    p.hint {
+      margin: 4px 0 0 0;
+      font-size: 0.85rem;
+      color: #666;
+    }
+    input[type="file"] {
+      display: block;
+      padding: 8px 0;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 220px;
+      font-family: inherit;
+      font-size: 0.95rem;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      resize: vertical;
+    }
+    button {
+      margin-top: 28px;
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      font-size: 1rem;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    button:disabled {
+      background: #93c5fd;
+      cursor: not-allowed;
+    }
+    .flash, #error-box {
+      background: #fee2e2;
+      border: 1px solid #fca5a5;
+      color: #991b1b;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-top: 16px;
+      display: none;
+    }
+    #progress-section {
+      margin-top: 28px;
+      display: none;
+    }
+    #progress-label {
+      font-size: 0.9rem;
+      color: #444;
+      margin-bottom: 6px;
+    }
+    #progress-track {
+      width: 100%;
+      background: #e5e7eb;
+      border-radius: 999px;
+      height: 14px;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #2563eb;
+      border-radius: 999px;
+      transition: width 0.2s ease;
+    }
+  </style>
+</head>
+<body>
+  <h1>QR Code Document Generator</h1>
+  <p>Upload a CSV containing a column of links, and a Word document will be
+     created with one QR code per link, each paired with a random phrase.</p>
+
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      {% for message in messages %}
+        <div class="flash" style="display:block;">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div id="error-box"></div>
+
+  <form id="generate-form">
+
+    <label for="csv_file">1. CSV file</label>
+    <input type="file" id="csv_file" name="csv_file" accept=".csv" required>
+    <p class="hint">The file must contain a column named "Link" (or any column whose values start with "http").</p>
+
+    <label for="phrases">2. Phrases</label>
+    <textarea id="phrases" name="phrases">{{ default_phrases }}</textarea>
+    <p class="hint">One phrase per line. A random phrase from this list is placed under each QR code. Edit or replace as you like.</p>
+
+    <button type="submit" id="submit-btn">3. Generate &amp; download Word document</button>
+  </form>
+
+  <div id="progress-section">
+    <div id="progress-label">Creating QR code 0 of 0…</div>
+    <div id="progress-track">
+      <div id="progress-fill"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('generate-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const progressSection = document.getElementById('progress-section');
+    const progressLabel = document.getElementById('progress-label');
+    const progressFill = document.getElementById('progress-fill');
+    const errorBox = document.getElementById('error-box');
+
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.style.display = 'block';
+    }
+
+    function resetUI() {
+      errorBox.style.display = 'none';
+      progressSection.style.display = 'none';
+      progressFill.style.width = '0%';
+      submitBtn.disabled = false;
+      submitBtn.textContent = '3. Generate & download Word document';
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      errorBox.style.display = 'none';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Starting…';
+
+      const formData = new FormData(form);
+
+      let startResp;
+      try {
+        startResp = await fetch('/start', { method: 'POST', body: formData });
+      } catch (err) {
+        showError('Could not reach the server. Please try again.');
+        resetUI();
+        return;
+      }
+
+      const startData = await startResp.json();
+      if (!startResp.ok) {
+        showError(startData.error || 'Something went wrong starting the job.');
+        resetUI();
+        return;
+      }
+
+      const jobId = startData.job_id;
+      submitBtn.textContent = 'Generating…';
+      progressSection.style.display = 'block';
+      progressLabel.textContent = 'Creating QR codes…';
+
+      let pollInFlight = false;  // skip a tick if the previous fetch hasn't resolved yet
+      let settled = false;       // stop handling once we've already reacted to done/error
+
+      const poll = setInterval(async () => {
+        if (pollInFlight || settled) return;
+        pollInFlight = true;
+
+        let progResp;
+        try {
+          progResp = await fetch(`/progress/${jobId}`);
+        } catch (err) {
+          if (!settled) {
+            settled = true;
+            clearInterval(poll);
+            showError('Lost connection while generating the document.');
+            resetUI();
+          }
+          pollInFlight = false;
+          return;
+        }
+
+        if (settled) { pollInFlight = false; return; }
+
+        if (!progResp.ok) {
+          settled = true;
+          clearInterval(poll);
+          showError('Lost track of the generation job. Please try again.');
+          resetUI();
+          pollInFlight = false;
+          return;
+        }
+
+        const data = await progResp.json();
+        if (settled) { pollInFlight = false; return; }
+
+        if (data.status === 'running') {
+          const pct = data.total ? Math.round((data.current / data.total) * 100) : 0;
+          progressFill.style.width = pct + '%';
+          progressLabel.textContent = `Creating QR code ${data.current} of ${data.total}… (${pct}%)`;
+        } else if (data.status === 'done') {
+          settled = true;
+          clearInterval(poll);
+          progressFill.style.width = '100%';
+          progressLabel.textContent = 'Done! Downloading…';
+          window.location.href = `/download/${jobId}`;
+          setTimeout(resetUI, 1200);
+        } else if (data.status === 'error') {
+          settled = true;
+          clearInterval(poll);
+          showError(data.error || 'Something went wrong while generating the document.');
+          resetUI();
+        }
+
+        pollInFlight = false;
+      }, 400);
+    });
+  </script>
+</body>
+</html>
